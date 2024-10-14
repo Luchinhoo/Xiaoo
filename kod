@@ -1,0 +1,147 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+
+#define SCAN_TIME 10 // Czas skanowania w sekundach
+
+BLEScan* pBLEScan;
+
+// Struktura do przetwarzania danych z urządzeń BLE
+struct DataFrame {
+    uint8_t bytes[29]; // Maksymalnie 29 bajtów dla dłuższych danych
+
+    // Funkcja przetwarzająca dane temperatury
+    float GetTemperature(uint8_t lsbT, uint8_t msbT) {
+        uint16_t rawTemperature = (msbT << 8) | lsbT;
+
+        // Przeliczenie wartości surowej na temperaturę zgodnie z dokumentacją
+        float temperature = (175.72 * rawTemperature * 4 / 65536.0) - 46.85;
+
+        // Ograniczenie wartości temperatury do przedziału [-30, 70]
+        if (temperature < -30) {
+            temperature = -30;
+        } else if (temperature > 70) {
+            temperature = 70;
+        }
+
+        return temperature;
+    }
+
+    // Funkcja przetwarzająca dane wilgotności
+    float GetHumidity(uint8_t lsbH, uint8_t msbH) {
+        uint16_t rawHumidity = (msbH << 8) | lsbH;
+
+        // Przeliczenie wartości surowej na wilgotność zgodnie z dokumentacją
+        float humidity = (125.0 * rawHumidity * 4 / 65536.0) - 6;
+
+        // Ograniczenie wartości wilgotności do przedziału [1, 100]
+        if (humidity < 1) {
+            humidity = 1;
+        } else if (humidity > 100) {
+            humidity = 100;
+        }
+
+        return humidity;
+    }
+
+    // Funkcja przetwarzająca poziom baterii (bajty 3 i 4) na poziom baterii
+    int GetBatteryLevel(uint16_t groupsAndBatteryData) {
+        int battery = (groupsAndBatteryData >> 12) & 0x0F; // Wyciągamy bity baterii
+
+        if (battery == 1) {
+            return 100; // Pełne naładowanie
+        } else {
+            return 10 * (std::min(battery, 11) - 1); // Przeliczamy procent naładowania baterii
+        }
+    }
+
+    // Funkcja przetwarzająca poziom baterii na napięcie [V]
+    float GetBatteryVoltage(uint16_t groupsAndBatteryData) {
+        int batteryLevel = GetBatteryLevel(groupsAndBatteryData); // Wyciągamy poziom baterii (procenty)
+
+        // Przeliczamy napięcie baterii na podstawie poziomu
+        return ((batteryLevel - 10) * 1.2 / 100.0) + 1.8; // Obliczamy napięcie na podstawie poziomu baterii
+    }
+
+    // Funkcja do przetwarzania temperatury, wilgotności i napięcia baterii
+    void processMeasurement(int length, String deviceName, String macAddress) {
+        Serial.printf("Urządzenie: %s (MAC: %s)\n", deviceName.c_str(), macAddress.c_str());
+
+        if (length >= 12) {  // Dane mają odpowiednią długość
+            // Przetwarzanie temperatury (bajty 8 i 9)
+            float temperature = GetTemperature(bytes[8], bytes[9]);
+
+            // Odczyt poziomu baterii (napięcia) z bajtów 3 i 4
+            uint16_t groupsAndBatteryData = (bytes[3] << 8) | bytes[4];
+            float batteryVoltage = GetBatteryVoltage(groupsAndBatteryData);
+
+            // Przetwarzanie wilgotności dla iNode-B (bajty 10 i 11)
+            if (deviceName.startsWith("iNode-B") || deviceName.startsWith("W-264-B")) {
+                float humidity = GetHumidity(bytes[10], bytes[11]);
+                Serial.printf("Temperatura: %.2f C, Wilgotność: %.2f %%, Bateria: %.2f V\n", temperature, humidity, batteryVoltage);
+            } else {
+                // Tylko temperatura 
+                Serial.printf("Temperatura: %.2f C, Bateria: %.2f V\n", temperature, batteryVoltage);
+            }
+        } else {
+            Serial.println("Nieznana długość danych. Przetwarzanie niemożliwe.");
+        }
+    }
+};
+
+// Funkcja przetwarzająca dane producenta z urządzeń BLE
+void przetworzDaneProducenta(std::string daneProducenta, String deviceName, String macAddress) {
+    Serial.printf("Długość danych producenta: %d\n", daneProducenta.length());
+
+    // Przykład przetwarzania danych (dla długości do 29 bajtów)
+    DataFrame frame;
+    memcpy(frame.bytes, daneProducenta.data(), daneProducenta.length()); // Kopiowanie danych do ramki
+    frame.processMeasurement(daneProducenta.length(), deviceName, macAddress); // Przetwarzanie danych
+}
+
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) {
+        // Sprawdzanie, czy urządzenie ma nazwę
+        if (advertisedDevice.haveName()) {
+            String deviceName = advertisedDevice.getName().c_str();
+            String macAddress = advertisedDevice.getAddress().toString().c_str(); // Pobranie adresu MAC
+            Serial.printf("Znaleziono urządzenie: %s (MAC: %s)\n", deviceName.c_str(), macAddress.c_str());
+
+            // Sprawdzenie, czy urządzenie ma dane producenta
+            if (advertisedDevice.haveManufacturerData()) {
+                Serial.println("Znaleziono dane producenta. Przetwarzanie...");
+                std::string daneProducenta = advertisedDevice.getManufacturerData();
+                przetworzDaneProducenta(daneProducenta, deviceName, macAddress);  // Przekazujemy nazwę urządzenia oraz MAC
+            } else {
+                Serial.println("Brak danych producenta dla urządzenia.");
+            }
+        }
+    }
+};
+
+void setup() {
+    Serial.begin(115200);
+
+    // Inicjalizacja BLE
+    BLEDevice::init("");
+
+    // Utworzenie instancji skanowania BLE
+    pBLEScan = BLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    pBLEScan->setActiveScan(true); // Aktywne skanowanie
+    pBLEScan->setInterval(100);    // Interwał skanowania
+    pBLEScan->setWindow(99);       // Okno skanowania
+}
+
+void loop() {
+    // Rozpoczynamy skanowanie urządzeń BLE
+    Serial.println("Rozpoczynam skanowanie urządzeń BLE...");
+    BLEScanResults znalezioneUrzadzenia = pBLEScan->start(SCAN_TIME, false);
+    Serial.printf("Znaleziono %d urządzeń BLE\n", znalezioneUrzadzenia.getCount());
+
+    // Czyszczenie wyników skanowania i opóźnienie przed następnym skanowaniem
+    pBLEScan->clearResults();
+    delay(10000); // Opóźnienie między skanowaniami
+}
